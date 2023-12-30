@@ -1,5 +1,7 @@
 # fnhook
-A simple, batteries included library for hooking standard library functions from an external program on macOS. Currently only supports aarch64.
+A simple, batteries included library for hooking / trapping standard library functions calls from an external program on macOS. Currently only supports aarch64.
+
+This was heavily inspired by [fishhook](https://github.com/facebook/fishhook), but with a significantly different API.
 
 ## !! NOTE !!
 You will need to sign whatever application you include this in with the `com.apple.security.cs.debugger` entitlement. This library depends on `task_for_pid`, which requires
