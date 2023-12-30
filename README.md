@@ -36,3 +36,4 @@ codesign -f -s "my-trusted-cert-for-signing-code" --preserve-metadata=identifier
 - [ ] support x86_64 hooking
 - [ ] cross-platform support (?)
 - [ ] allow for dynamic payloads
+- [ ] un-hooking functions
