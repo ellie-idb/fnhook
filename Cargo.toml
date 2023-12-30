@@ -2,6 +2,8 @@
 name = "fnhook"
 version = "0.1.0"
 edition = "2021"
+description = "A simple, batteries-included way of hooking standard library functions on macOS"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib"]
