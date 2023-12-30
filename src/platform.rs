@@ -17,27 +17,24 @@ use mach2::vm_region::{
 };
 use mach2::vm_statistics::VM_FLAGS_ANYWHERE;
 
+use super::error::{Error, Result};
 use mach2::kern_return::KERN_SUCCESS;
 use mach2::port::{mach_port_name_t, mach_port_t, MACH_PORT_NULL};
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
-use system_error::Error;
-
-pub type KernResult<T> = Result<T, Error>;
 
 type Pid = pid_t;
 
-pub fn get_pid_for_name(name: &str) -> KernResult<Pid> {
-    let pids = processes::pids_by_type(processes::ProcFilter::All).unwrap();
+pub fn get_pid_for_name(name: &str) -> Result<Pid> {
+    let pids = processes::pids_by_type(processes::ProcFilter::All)?;
     let pid = pids
         .iter()
-        .find(|pid| proc_pid::name(i32::try_from(**pid).unwrap()).unwrap() == name);
-    pid.map_or_else(
-        || Err(Error::last_os_error()),
-        |pid| Ok(i32::try_from(*pid).unwrap()),
-    )
+        .map(|pid| i32::try_from(*pid))
+        .filter_map(std::result::Result::ok)
+        .find(|pid| proc_pid::name(*pid).is_ok_and(|x| x == name));
+    pid.map_or_else(|| Err(Error::from_last_os_error().into()), Ok)
 }
 
-pub fn task_for_pid(pid: Pid) -> KernResult<mach_port_name_t> {
+pub fn task_for_pid(pid: Pid) -> Result<mach_port_name_t> {
     if pid == unsafe { libc::getpid() } as Pid {
         return Ok(unsafe { mach2::traps::mach_task_self() });
     }
@@ -48,7 +45,7 @@ pub fn task_for_pid(pid: Pid) -> KernResult<mach_port_name_t> {
         let result =
             mach2::traps::task_for_pid(mach2::traps::mach_task_self(), pid as c_int, &mut task);
         if result != KERN_SUCCESS {
-            return Err(Error::from_raw_kernel_error(result));
+            return Err(Error::from_kernel_error(result).into());
         }
     }
 
@@ -63,12 +60,12 @@ mod traps {
     }
 }
 
-pub fn pid_for_task(task: mach_port_t) -> KernResult<pid_t> {
+pub fn pid_for_task(task: mach_port_t) -> Result<pid_t> {
     unsafe {
         let mut pid: libc::c_int = 0;
         let result = traps::pid_for_task(task, std::ptr::addr_of_mut!(pid));
         if result != KERN_SUCCESS {
-            return Err(system_error::Error::from_raw_kernel_error(result));
+            return Err(Error::from_kernel_error(result).into());
         }
         Ok(pid)
     }
@@ -120,7 +117,7 @@ pub fn scan_memory_region(
     data: &[u8],
     address: &mach_vm_address_t,
     size: &mach_vm_size_t,
-) -> KernResult<Option<mach_vm_address_t>> {
+) -> Result<Option<mach_vm_address_t>> {
     let mut buf: Vec<u8> = Vec::default();
     buf.resize(1024 * 1024 * 2, 0);
 
@@ -137,16 +134,15 @@ pub fn scan_memory_region(
                 std::ptr::addr_of_mut!(out_size),
             );
             if ret != KERN_SUCCESS {
-                return Err(Error::from_raw_kernel_error(ret));
+                return Err(Error::from_kernel_error(ret).into());
             }
             if out_size <= data.len() as u64 {
                 break;
             }
             for i in 0..out_size - data.len() as u64 {
-                let window_start = i;
-                let window_end = i + data.len() as u64;
-                let window = &buf
-                    [usize::try_from(window_start).unwrap()..usize::try_from(window_end).unwrap()];
+                let window_start = usize::try_from(i)?;
+                let window_end = usize::try_from(i + data.len() as u64)?;
+                let window = &buf[window_start..window_end];
                 if window == data {
                     return Ok(Some(address + i));
                 }
@@ -219,7 +215,7 @@ pub enum EnumerateResult {
     ContinueEnumerating,
 }
 
-pub fn enumerate_task_memory_regions<F>(task: mach_port_t, mut f: F) -> KernResult<()>
+pub fn enumerate_task_memory_regions<F>(task: mach_port_t, mut f: F) -> Result<()>
 where
     F: FnMut(
         &mach2::vm_region::vm_region_submap_info_64,
@@ -260,9 +256,9 @@ where
                     4096,
                 );
                 if ret < 0 {
-                    return Err(Error::from_raw_os_error(ret));
+                    return Err(Error::from_os_error(ret).into());
                 }
-                let module = std::ffi::CStr::from_bytes_until_nul(&str).unwrap();
+                let module = std::ffi::CStr::from_bytes_until_nul(&str)?;
                 if f(&info, module, &address, &size) == EnumerateResult::StopEnumerating {
                     break;
                 }
@@ -278,7 +274,7 @@ pub fn scan_task_memory_regions(
     task: mach_port_t,
     data: &[u8],
     prot: vm_prot_t,
-) -> Option<mach_vm_address_t> {
+) -> Result<Option<mach_vm_address_t>> {
     let mut result: Option<mach_vm_address_t> = None;
     enumerate_task_memory_regions(
         task,
@@ -298,16 +294,15 @@ pub fn scan_task_memory_regions(
                 },
             )
         },
-    )
-    .unwrap();
-    result
+    )?;
+    Ok(result)
 }
 
 pub fn scan_task_memory_region_multi(
     task: mach_port_t,
     data: &[u8],
     prot: vm_prot_t,
-) -> Option<Vec<usize>> {
+) -> Result<Option<Vec<usize>>> {
     let mut result: Vec<usize> = Vec::default();
     enumerate_task_memory_regions(task, |info, module_name, module_start, module_size| {
         if info.protection & prot == 0 {
@@ -324,16 +319,15 @@ pub fn scan_task_memory_region_multi(
             result.append(&mut region_results);
         }
         EnumerateResult::ContinueEnumerating
-    })
-    .unwrap();
+    })?;
     if result.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(result)
+        Ok(Some(result))
     }
 }
 
-pub fn dump_task_memory_regions(task: mach_port_t) {
+pub fn dump_task_memory_regions(task: mach_port_t) -> Result<()> {
     enumerate_task_memory_regions(task, |info, module_name, module_start, module_size| {
         println!(
             "{module_name:?} {:08x?} - {:08x?} {:} {:} {:}",
@@ -344,17 +338,22 @@ pub fn dump_task_memory_regions(task: mach_port_t) {
             fmt_share_mode(info.share_mode)
         );
         EnumerateResult::ContinueEnumerating
-    })
-    .unwrap();
+    })?;
+    Ok(())
 }
 
 pub fn read_task_memory(
     task: mach_port_t,
     address: mach_vm_address_t,
     len: mach_vm_size_t,
-) -> KernResult<Vec<u8>> {
+) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::default();
-    buf.resize(usize::try_from(len).unwrap(), 0);
+    let len_us = usize::try_from(len)?;
+    if len_us == 0 {
+        return Err(Error::zero_length().into());
+    }
+
+    buf.resize(len_us, 0);
 
     unsafe {
         let mut out_size: u64 = 0;
@@ -366,9 +365,9 @@ pub fn read_task_memory(
             std::ptr::addr_of_mut!(out_size),
         );
         if ret != KERN_SUCCESS {
-            return Err(Error::from_raw_kernel_error(ret));
+            return Err(Error::from_kernel_error(ret).into());
         }
-        buf.set_len(usize::try_from(len).unwrap());
+        buf.set_len(len_us);
     }
 
     Ok(buf)
@@ -378,7 +377,7 @@ pub fn allocate_task_memory(
     task: mach_port_t,
     len: vm_size_t,
     prot: vm_prot_t,
-) -> KernResult<mach_vm_address_t> {
+) -> Result<mach_vm_address_t> {
     unsafe {
         let mut address: mach_vm_address_t = 0;
         let ret = mach_vm_allocate(
@@ -388,11 +387,11 @@ pub fn allocate_task_memory(
             VM_FLAGS_ANYWHERE,
         );
         if ret != KERN_SUCCESS {
-            return Err(Error::from_raw_kernel_error(ret));
+            return Err(Error::from_kernel_error(ret).into());
         }
         let ret = mach_vm_protect(task, address, len as u64, 0, prot);
         if ret != KERN_SUCCESS {
-            return Err(system_error::Error::from_raw_kernel_error(ret));
+            return Err(Error::from_kernel_error(ret).into());
         }
         Ok(address as mach_vm_address_t)
     }
@@ -404,11 +403,11 @@ pub fn set_memory_protection(
     len: mach_vm_size_t,
     set_maximum: boolean_t,
     new_prot: vm_prot_t,
-) -> KernResult<()> {
+) -> Result<()> {
     unsafe {
         let ret = mach_vm_protect(task, address, len, set_maximum, new_prot);
         if ret != KERN_SUCCESS {
-            return Err(Error::from_raw_kernel_error(ret));
+            return Err(Error::from_kernel_error(ret).into());
         }
         Ok(())
     }
@@ -418,17 +417,18 @@ pub fn write_task_memory(
     task: mach_port_t,
     address: mach_vm_address_t,
     data: &[u8],
-) -> KernResult<usize> {
+) -> Result<usize> {
+    let data_len: u32 = data.len().try_into()?;
     unsafe {
         let mut data = Vec::from(data);
         let ret = mach_vm_write(
             task,
             address,
             data.as_mut_ptr() as uintptr_t,
-            data.len().try_into().unwrap(),
+            data_len,
         );
         if ret != KERN_SUCCESS {
-            return Err(Error::from_raw_kernel_error(ret));
+            return Err(Error::from_kernel_error(ret).into());
         }
         Ok(data.len())
     }
@@ -439,11 +439,11 @@ pub fn copy_task_memory(
     src_address: mach_vm_address_t,
     dest_address: mach_vm_address_t,
     size: mach_vm_size_t,
-) -> KernResult<mach_vm_size_t> {
+) -> Result<mach_vm_size_t> {
     unsafe {
         let kret = mach_vm_copy(task, src_address, size, dest_address);
         if kret != KERN_SUCCESS {
-            return Err(Error::from_raw_kernel_error(kret));
+            return Err(Error::from_kernel_error(kret).into());
         }
         Ok(size)
     }

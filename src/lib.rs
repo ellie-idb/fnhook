@@ -1,65 +1,116 @@
 //! A simple, batteries included library for hooking standard library functions
 //! from an external program on macOS. Currently only supports aarch64.
+mod error;
 mod nlist;
 pub mod platform;
-use nlist::Nlist;
+use dynasmrt::{dynasm, DynasmLabelApi};
+use error::{Error, Result};
 use mach2::port::mach_port_t;
 use mach2::vm_prot::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE};
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
 use mach_object::{
-    LoadCommand, MachCommand, OFile,
-    S_LAZY_SYMBOL_POINTERS, S_NON_LAZY_SYMBOL_POINTERS, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL,
+    LoadCommand, MachCommand, OFile, INDIRECT_SYMBOL_ABS, INDIRECT_SYMBOL_LOCAL,
+    S_LAZY_SYMBOL_POINTERS, S_NON_LAZY_SYMBOL_POINTERS,
 };
-use std::io::Cursor;
+use nlist::Nlist;
 use nom::IResult;
-use platform::KernResult;
-use dynasmrt::{dynasm, DynasmLabelApi};
+use std::io::Cursor;
 
 pub struct FnHook {
-   task: mach_port_t,
+    task: mach_port_t,
     hooked_addr: mach_vm_address_t,
     pause_flag_addr: mach_vm_address_t,
     hit_flag_addr: mach_vm_address_t,
     hook_cave_addr: Option<mach_vm_address_t>,
 }
 
+fn indirect_sym_parser(input: &[u8]) -> IResult<&[u8], u32> {
+    let (input, a) = nom::number::complete::le_u32(input)?;
+    Ok((input, a))
+}
+
+struct SymbolTableParser<'a> {
+    str_table: &'a [u8],
+    sym_table: &'a [u8],
+}
+
+impl<'a> SymbolTableParser<'a> {
+    fn not_null_terminator(input: &[u8]) -> IResult<&[u8], &[u8]> {
+        nom::bytes::complete::is_not([0])(input)
+    }
+
+    fn get_string(&self, index: usize) -> IResult<&'a [u8], String, nom::error::Error<Vec<u8>>> {
+        let slice = &self.str_table[index..];
+        match Self::not_null_terminator(slice) {
+            Ok((input, string)) => {
+                let string = std::str::from_utf8(string).unwrap_or_default();
+                Ok((input, string.to_string()))
+            }
+            Err(x) => Err(x.to_owned()),
+        }
+    }
+
+    fn parse_entry(&self, input: &'a [u8]) -> IResult<&'a [u8], (Nlist, String)> {
+        let (input, nlist) = Nlist::parse(input)?;
+        let (_, str) = self.get_string(nlist.n_strx as usize).unwrap_or_default();
+
+        Ok((input, (nlist, str)))
+    }
+
+    fn parse(
+        &self,
+        nsyms: usize,
+    ) -> IResult<&'a [u8], Vec<(Nlist, String)>, nom::error::Error<Vec<u8>>> {
+        let e = nom::multi::count(|x| self.parse_entry(x), nsyms)(self.sym_table);
+        match e {
+            Ok((input, nlist)) => Ok((input, nlist)),
+            Err(e) => Err(e.to_owned()),
+        }
+    }
+}
+
 impl FnHook {
-    pub fn read_pause_flag(&self) -> platform::KernResult<u64> {
+    pub fn read_pause_flag(&self) -> Result<u64> {
         let bytes = platform::read_task_memory(
             self.task,
             self.pause_flag_addr,
             std::mem::size_of::<u64>() as u64,
         )?;
-        Ok(u64::from_ne_bytes(bytes.try_into().unwrap()))
+        let result: u64 = u64::from_ne_bytes(bytes.try_into().unwrap_or_default());
+        Ok(result)
     }
 
-    pub fn read_hit_flag(&self) -> platform::KernResult<u64> {
+    pub fn read_hit_flag(&self) -> Result<u64> {
         let bytes = platform::read_task_memory(
             self.task,
             self.hit_flag_addr,
             std::mem::size_of::<u64>() as u64,
         )?;
-        Ok(u64::from_ne_bytes(bytes.try_into().unwrap()))
+        let result = u64::from_ne_bytes(bytes.try_into().unwrap_or_default());
+        Ok(result)
     }
 
-    pub fn set_pause_flag(&self, data: u64) -> platform::KernResult<()> {
+    pub fn set_pause_flag(&self, data: u64) -> Result<()> {
         platform::write_task_memory(self.task, self.pause_flag_addr, &data.to_ne_bytes())?;
         Ok(())
     }
 
-    pub fn clear_hit_flag(&self) -> platform::KernResult<()> {
+    pub fn clear_hit_flag(&self) -> Result<()> {
         platform::write_task_memory(self.task, self.hit_flag_addr, &[0; 8])?;
         Ok(())
     }
 
-    pub fn hook_fn(&mut self) -> platform::KernResult<()> {
+    pub fn hook_fn(&mut self) -> Result<()> {
         if self.hook_cave_addr.is_some() {
             return Ok(());
         }
 
-        let mut ops = dynasmrt::aarch64::Assembler::new().unwrap();
-        let orig_ptr = platform::read_task_memory(self.task, self.hooked_addr, 8).unwrap();
-        println!("{:08x?}", u64::from_le_bytes(orig_ptr.clone().try_into().unwrap()));
+        let mut ops = dynasmrt::aarch64::Assembler::new()?;
+        let orig_ptr = platform::read_task_memory(self.task, self.hooked_addr, 8)?;
+        println!(
+            "{:08x?}",
+            u64::from_le_bytes(orig_ptr.clone().try_into().unwrap_or_default())
+        );
 
         dynasm!(ops
             ; .arch aarch64
@@ -84,7 +135,10 @@ impl FnHook {
             ; .bytes self.hit_flag_addr.to_ne_bytes()
         );
 
-        let hook = ops.finalize().unwrap();
+        let Ok(hook) = ops.finalize() else {
+            return Err(Error::dynasm_error().into());
+        };
+
         let hook_cave_addr =
             platform::allocate_task_memory(self.task, hook.len(), VM_PROT_READ | VM_PROT_WRITE)?;
         platform::write_task_memory(self.task, hook_cave_addr, &hook)?;
@@ -106,23 +160,22 @@ impl FnHook {
         Ok(())
     }
 
-    pub fn new(task: mach_port_t, fn_address: mach_vm_address_t) -> Self {
+    pub fn new(task: mach_port_t, fn_address: mach_vm_address_t) -> Result<Self> {
         let pause_flag_addr =
-            platform::allocate_task_memory(task, 8, VM_PROT_READ | VM_PROT_WRITE).unwrap();
-        let hit_flag_addr =
-            platform::allocate_task_memory(task, 8, VM_PROT_READ | VM_PROT_WRITE).unwrap();
-        platform::write_task_memory(task, pause_flag_addr, &[0; 8]).unwrap();
-        platform::write_task_memory(task, hit_flag_addr, &[0; 8]).unwrap();
+            platform::allocate_task_memory(task, 8, VM_PROT_READ | VM_PROT_WRITE)?;
+        let hit_flag_addr = platform::allocate_task_memory(task, 8, VM_PROT_READ | VM_PROT_WRITE)?;
+        platform::write_task_memory(task, pause_flag_addr, &[0; 8])?;
+        platform::write_task_memory(task, hit_flag_addr, &[0; 8])?;
         println!("allocated pause flag at 0x{pause_flag_addr:08x?}");
         println!("allocated hit flag at 0x{hit_flag_addr:08x?}");
 
-        Self {
+        Ok(Self {
             task,
             hooked_addr: fn_address,
             pause_flag_addr,
             hit_flag_addr,
             hook_cave_addr: None,
-        }
+        })
     }
 
     fn find_text_segment(
@@ -132,19 +185,12 @@ impl FnHook {
     ) -> Option<LoadCommand> {
         let buf = platform::read_task_memory(task, base_address, base_size).unwrap();
         let mut cursor = Cursor::new(&buf);
-        if let Ok(OFile::MachFile {
-            ref commands,
-            ..
-        }) = OFile::parse(&mut cursor)
-        {
+        if let Ok(OFile::MachFile { ref commands, .. }) = OFile::parse(&mut cursor) {
             for MachCommand(cmd, _) in commands {
-                match cmd {
-                    LoadCommand::Segment64 { segname, .. } => {
-                        if segname == "__TEXT" {
-                            return Some(cmd.clone());
-                        }
+                if let LoadCommand::Segment64 { segname, .. } = cmd {
+                    if segname == "__TEXT" {
+                        return Some(cmd.clone());
                     }
-                    _ => (),
                 }
             }
         }
@@ -158,11 +204,7 @@ impl FnHook {
     ) -> Option<LoadCommand> {
         let buf = platform::read_task_memory(task, base_address, base_size).unwrap();
         let mut cursor = Cursor::new(&buf);
-        if let Ok(OFile::MachFile {
-            ref commands,
-            ..
-        }) = OFile::parse(&mut cursor)
-        {
+        if let Ok(OFile::MachFile { ref commands, .. }) = OFile::parse(&mut cursor) {
             for MachCommand(cmd, _) in commands {
                 if let LoadCommand::Segment64 { segname, .. } = cmd {
                     if segname == "__LINKEDIT" {
@@ -181,11 +223,7 @@ impl FnHook {
     ) -> Option<LoadCommand> {
         let buf = platform::read_task_memory(task, base_address, base_size).unwrap();
         let mut cursor = Cursor::new(&buf);
-        if let Ok(OFile::MachFile {
-            ref commands,
-            ..
-        }) = OFile::parse(&mut cursor)
-        {
+        if let Ok(OFile::MachFile { ref commands, .. }) = OFile::parse(&mut cursor) {
             for MachCommand(cmd, _) in commands {
                 if let LoadCommand::SymTab { .. } = cmd {
                     return Some(cmd.clone());
@@ -202,11 +240,7 @@ impl FnHook {
     ) -> Option<LoadCommand> {
         let buf = platform::read_task_memory(task, base_address, base_size).unwrap();
         let mut cursor = Cursor::new(&buf);
-        if let Ok(OFile::MachFile {
-            ref commands,
-            ..
-        }) = OFile::parse(&mut cursor)
-        {
+        if let Ok(OFile::MachFile { ref commands, .. }) = OFile::parse(&mut cursor) {
             for MachCommand(cmd, _) in commands {
                 if let LoadCommand::DySymTab { .. } = cmd {
                     return Some(cmd.clone());
@@ -220,7 +254,7 @@ impl FnHook {
         task: mach_port_t,
         base_address: mach_vm_address_t,
         base_size: mach_vm_size_t,
-    ) -> platform::KernResult<Vec<u32>> {
+    ) -> Result<Vec<u32>> {
         let dy_sym_tab = Self::find_dyn_sym_tab(task, base_address, base_size).unwrap();
         let LoadCommand::DySymTab {
             nindirectsyms,
@@ -258,7 +292,8 @@ impl FnHook {
 
         let slide = base_address - text_segment_base as u64;
         let link_edit_segment_addr = slide + link_edit_segment_base as u64;
-        let indirect_sym_offset = indirectsymoff as u64 - link_edit_segment_fileoff as u64;
+        let indirect_sym_offset =
+            usize::try_from(u64::from(indirectsymoff) - link_edit_segment_fileoff as u64)?;
 
         let buf = platform::read_task_memory(
             task,
@@ -266,13 +301,10 @@ impl FnHook {
             link_edit_segment_size.try_into().unwrap(),
         )?;
 
-        fn parser<'a>(input: &'a [u8]) -> IResult<&[u8], u32> {
-            let (input, a) = nom::number::complete::le_u32(input)?;
-            Ok((input, a))
-        }
-
-        if let Ok((_, indirect_syms)) =
-            nom::multi::count(parser, nindirectsyms as usize)(&buf[indirect_sym_offset as usize..])
+        if let Ok((_, indirect_syms)) = nom::multi::count(
+            indirect_sym_parser,
+            nindirectsyms as usize,
+        )(&buf[indirect_sym_offset..])
         {
             return Ok(indirect_syms);
         }
@@ -284,9 +316,12 @@ impl FnHook {
         task: mach_port_t,
         base_address: mach_vm_address_t,
         base_size: mach_vm_size_t,
-    ) -> platform::KernResult<Vec<(Nlist, String)>> {
-        let link_edit_segment =
-            Self::find_link_edit_segment(task, base_address, base_size).unwrap();
+    ) -> Result<Vec<(Nlist, String)>> {
+        let Some(link_edit_segment) = Self::find_link_edit_segment(task, base_address, base_size)
+        else {
+            return Err(Error::missing_segment("__LINKEDIT").into());
+        };
+
         let LoadCommand::SymTab {
             symoff,
             nsyms,
@@ -316,37 +351,26 @@ impl FnHook {
             unreachable!()
         };
 
-        let slide = base_address - text_segment_base as u64;
-        let link_edit_segment_addr = slide + link_edit_segment_base as u64;
-        let actual_sym_off = symoff as u64 - link_edit_segment_fileoff as u64;
-        let actual_str_off = stroff as u64 - link_edit_segment_fileoff as u64;
-        let buf = platform::read_task_memory(
-            task,
-            link_edit_segment_addr,
-            link_edit_segment_size.try_into().unwrap(),
-        )?;
-        let sym_table = &buf[actual_sym_off as usize..];
-        let str_table = &buf[actual_str_off as usize..];
-        struct Parser<'a> {
-            str_table: &'a [u8],
-        }
+        let text_segment_base = u64::try_from(text_segment_base)?;
+        let link_edit_segment_base = u64::try_from(link_edit_segment_base)?;
+        let link_edit_segment_size = u64::try_from(link_edit_segment_size)?;
+        let link_edit_segment_fileoff = u64::try_from(link_edit_segment_fileoff)?;
 
-        impl<'a> Parser<'a> {
-            fn parse(&self, input: &'a [u8]) -> IResult<&'a [u8], (Nlist, String)> {
-                let (input, nlist) = Nlist::parse(input)?;
-                let (_, str) = nom::bytes::complete::take_until("\0")(
-                    &self.str_table[nlist.n_strx as usize..],
-                )?;
-                Ok((
-                    input,
-                    (nlist, std::str::from_utf8(str).unwrap().to_string()),
-                ))
-            }
-        }
+        let slide = base_address - text_segment_base;
+        let link_edit_segment_addr = slide + link_edit_segment_base;
+        let symoff = u64::from(symoff);
+        let stroff = u64::from(stroff);
+        let actual_sym_off = usize::try_from(symoff - link_edit_segment_fileoff)?;
+        let actual_str_off = usize::try_from(stroff - link_edit_segment_fileoff)?;
+        let buf = platform::read_task_memory(task, link_edit_segment_addr, link_edit_segment_size)?;
+        let sym_table = &buf[actual_sym_off..];
+        let str_table = &buf[actual_str_off..];
 
-        let parser = Parser { str_table };
-        let (_, nlist) =
-            nom::multi::count(|input| parser.parse(input), nsyms as usize)(sym_table).unwrap();
+        let parser = SymbolTableParser {
+            str_table,
+            sym_table,
+        };
+        let (_, nlist) = parser.parse(nsyms as usize)?;
         Ok(nlist)
     }
 
@@ -355,8 +379,11 @@ impl FnHook {
         f: &str,
         base_address: mach_vm_address_t,
         base_size: mach_vm_size_t,
-    ) -> KernResult<Option<mach_vm_address_t>> {
-        let text_segment = Self::find_text_segment(task, base_address, base_size).unwrap();
+    ) -> Result<Option<mach_vm_address_t>> {
+        let Some(text_segment) = Self::find_text_segment(task, base_address, base_size) else {
+            return Err(Error::missing_segment("__TEXT").into());
+        };
+
         let LoadCommand::Segment64 {
             vmaddr: text_segment_base,
             ..
@@ -368,17 +395,12 @@ impl FnHook {
         let slide = base_address - text_segment_base as u64;
 
         let sym_tab = Self::grab_sym_table(task, base_address, base_size)?;
-        let indirect_sym_tab =
-            Self::grab_indirect_sym_table(task, base_address, base_size).unwrap();
+        let indirect_sym_tab = Self::grab_indirect_sym_table(task, base_address, base_size)?;
 
         let buf = platform::read_task_memory(task, base_address, base_size)?;
         let mut cursor = Cursor::new(&buf);
 
-        if let Ok(OFile::MachFile {
-            ref commands,
-            ..
-        }) = OFile::parse(&mut cursor)
-        {
+        if let Ok(OFile::MachFile { ref commands, .. }) = OFile::parse(&mut cursor) {
             for MachCommand(cmd, _) in commands {
                 if let LoadCommand::Segment64 {
                     sections: text_sections,
@@ -393,16 +415,29 @@ impl FnHook {
                         match section.flags.sect_type() {
                             S_LAZY_SYMBOL_POINTERS | S_NON_LAZY_SYMBOL_POINTERS => {
                                 dbg!(section.addr as u64 + slide);
-                                let indirect_symbol_bindings = platform::read_task_memory(task, section.addr as u64 + slide, section.size as u64).unwrap();
-                                let indirect_sym_tab = &indirect_sym_tab[section.reserved1 as usize..];
-                                for (i, _) in indirect_symbol_bindings.chunks(8).map(|x| u64::from_le_bytes(x.try_into().unwrap())).enumerate() {
+                                let indirect_symbol_bindings = platform::read_task_memory(
+                                    task,
+                                    section.addr as u64 + slide,
+                                    section.size as u64,
+                                )?;
+                                let indirect_sym_tab =
+                                    &indirect_sym_tab[section.reserved1 as usize..];
+                                for (i, _) in indirect_symbol_bindings
+                                    .chunks(8)
+                                    .map(|x| u64::from_ne_bytes(x.try_into().unwrap()))
+                                    .enumerate()
+                                {
                                     let symtab_index = indirect_sym_tab[i];
-                                    if symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL || (symtab_index == INDIRECT_SYMBOL_ABS | INDIRECT_SYMBOL_LOCAL) {
+                                    if symtab_index == INDIRECT_SYMBOL_ABS
+                                        || symtab_index == INDIRECT_SYMBOL_LOCAL
+                                        || (symtab_index
+                                            == INDIRECT_SYMBOL_ABS | INDIRECT_SYMBOL_LOCAL)
+                                    {
                                         continue;
                                     }
                                     let (_, symbol_name) = &sym_tab[symtab_index as usize];
                                     if symbol_name == f {
-                                        let addr = i as u64 * 8 + (section.addr as u64 + slide);  
+                                        let addr = i as u64 * 8 + (section.addr as u64 + slide);
                                         return Ok(Some(addr));
                                     }
                                 }

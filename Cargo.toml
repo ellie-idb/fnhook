@@ -6,10 +6,10 @@ description = "A simple, batteries-included way of hooking standard library func
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib"]
 bench = false
 
 [dependencies]
+anyhow = "1.0.77"
 data-encoding = "2.5.0"
 dynasm = "2.0.0"
 dynasmrt = "2.0.0"
@@ -19,3 +19,4 @@ mach2 = "0.4.2"
 mach_object = "0.1.17"
 nom = "7.1.3"
 system_error = "0.1.1"
+thiserror = "1.0.52"
