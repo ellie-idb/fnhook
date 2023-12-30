@@ -14,7 +14,7 @@ pub enum Error<I = &'static [u8]> {
   #[error("Expected length greater than 0")]
   ZeroLength,
   #[error("Dynasm error")]
-  DynasmError,
+  Dynasm,
   #[error("Invalid UTF-8 data for string")]
   InvalidUtf8Data,
   #[error("Missing segment (segment name: {0:?})")]
@@ -30,8 +30,8 @@ impl Error<()> {
     Self::ZeroLength
   }
 
-  pub const fn dynasm_error() -> Self {
-    Self::DynasmError
+  pub const fn dynasm() -> Self {
+    Self::Dynasm
   }
 
   pub const fn invalid_utf8_data() -> Self {

@@ -3,7 +3,6 @@
 mod error;
 mod nlist;
 pub mod platform;
-use dynasmrt::{dynasm, DynasmLabelApi};
 use error::{Error, Result};
 use mach2::port::mach_port_t;
 use mach2::vm_prot::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE};
@@ -18,10 +17,9 @@ use std::io::Cursor;
 
 pub struct FnHook {
     task: mach_port_t,
-    hooked_addr: mach_vm_address_t,
-    pause_flag_addr: mach_vm_address_t,
-    hit_flag_addr: mach_vm_address_t,
-    hook_cave_addr: Option<mach_vm_address_t>,
+    hook_addr: mach_vm_address_t,
+    orig_fn_addr: mach_vm_address_t,
+    hook_cave_addr: mach_vm_address_t,
 }
 
 fn indirect_sym_parser(input: &[u8]) -> IResult<&[u8], u32> {
@@ -70,111 +68,41 @@ impl<'a> SymbolTableParser<'a> {
 }
 
 impl FnHook {
-    pub fn read_pause_flag(&self) -> Result<u64> {
-        let bytes = platform::read_task_memory(
-            self.task,
-            self.pause_flag_addr,
-            std::mem::size_of::<u64>() as u64,
-        )?;
-        let result: u64 = u64::from_ne_bytes(bytes.try_into().unwrap_or_default());
-        Ok(result)
-    }
+    pub fn hook_fn<T>(
+        task: mach_port_t,
+        hook_addr: mach_vm_address_t,
+        init_fn: T,
+    ) -> Result<Self>
+    where
+        T: Fn(mach_vm_address_t) -> Result<Vec<u8>>,
+    {
+        let orig_ptr = platform::read_task_memory(task, hook_addr, 8)?;
+        let orig_ptr = u64::from_ne_bytes(orig_ptr.try_into().unwrap());
 
-    pub fn read_hit_flag(&self) -> Result<u64> {
-        let bytes = platform::read_task_memory(
-            self.task,
-            self.hit_flag_addr,
-            std::mem::size_of::<u64>() as u64,
-        )?;
-        let result = u64::from_ne_bytes(bytes.try_into().unwrap_or_default());
-        Ok(result)
-    }
-
-    pub fn set_pause_flag(&self, data: u64) -> Result<()> {
-        platform::write_task_memory(self.task, self.pause_flag_addr, &data.to_ne_bytes())?;
-        Ok(())
-    }
-
-    pub fn clear_hit_flag(&self) -> Result<()> {
-        platform::write_task_memory(self.task, self.hit_flag_addr, &[0; 8])?;
-        Ok(())
-    }
-
-    pub fn hook_fn(&mut self) -> Result<()> {
-        if self.hook_cave_addr.is_some() {
-            return Ok(());
-        }
-
-        let mut ops = dynasmrt::aarch64::Assembler::new()?;
-        let orig_ptr = platform::read_task_memory(self.task, self.hooked_addr, 8)?;
-        println!(
-            "{:08x?}",
-            u64::from_le_bytes(orig_ptr.clone().try_into().unwrap_or_default())
-        );
-
-        dynasm!(ops
-            ; .arch aarch64
-            ; ->hook:
-            ; ldr x15, ->pause_flag_pool
-            ; ldr x15, [x15]
-            ; subs x15, x15, #0
-            ; cset x15, eq
-            ; tbnz x15, #0, ->orig
-            ; ldr x14, ->hit_flag_pool
-            ; mov x13, #1
-            ; str x13, [x14]
-            ; b ->hook
-            ; ->orig:
-            ; ldr x15, ->orig_addr
-            ; br x15
-            ; ->orig_addr:
-            ; .bytes orig_ptr
-            ; ->pause_flag_pool:
-            ; .bytes self.pause_flag_addr.to_ne_bytes()
-            ; ->hit_flag_pool:
-            ; .bytes self.hit_flag_addr.to_ne_bytes()
-        );
-
-        let Ok(hook) = ops.finalize() else {
-            return Err(Error::dynasm_error().into());
+        let Ok(hook) = init_fn(orig_ptr) else {
+            return Err(Error::dynasm().into());
         };
 
         let hook_cave_addr =
-            platform::allocate_task_memory(self.task, hook.len(), VM_PROT_READ | VM_PROT_WRITE)?;
-        platform::write_task_memory(self.task, hook_cave_addr, &hook)?;
+            platform::allocate_task_memory(task, hook.len(), VM_PROT_READ | VM_PROT_WRITE)?;
+        platform::write_task_memory(task, hook_cave_addr, &hook)?;
         platform::set_memory_protection(
-            self.task,
+            task,
             hook_cave_addr,
             hook.len() as mach_vm_size_t,
             0,
             VM_PROT_READ | VM_PROT_EXECUTE,
         )?;
         println!("hook cave at 0x{hook_cave_addr:08x?}");
-        println!(
-            "writing hook cave pointer to original address 0x{:08x?}",
-            self.hooked_addr
-        );
-        platform::write_task_memory(self.task, self.hooked_addr, &hook_cave_addr.to_ne_bytes())?;
+        println!("writing hook cave pointer to original address 0x{hook_addr:08x?}",);
+        platform::write_task_memory(task, hook_addr, &hook_cave_addr.to_ne_bytes())?;
         println!("hooked!");
-        self.hook_cave_addr = Some(hook_cave_addr);
-        Ok(())
-    }
-
-    pub fn new(task: mach_port_t, fn_address: mach_vm_address_t) -> Result<Self> {
-        let pause_flag_addr =
-            platform::allocate_task_memory(task, 8, VM_PROT_READ | VM_PROT_WRITE)?;
-        let hit_flag_addr = platform::allocate_task_memory(task, 8, VM_PROT_READ | VM_PROT_WRITE)?;
-        platform::write_task_memory(task, pause_flag_addr, &[0; 8])?;
-        platform::write_task_memory(task, hit_flag_addr, &[0; 8])?;
-        println!("allocated pause flag at 0x{pause_flag_addr:08x?}");
-        println!("allocated hit flag at 0x{hit_flag_addr:08x?}");
 
         Ok(Self {
             task,
-            hooked_addr: fn_address,
-            pause_flag_addr,
-            hit_flag_addr,
-            hook_cave_addr: None,
+            hook_addr,
+            orig_fn_addr: orig_ptr,
+            hook_cave_addr,
         })
     }
 
@@ -407,14 +335,12 @@ impl FnHook {
                     ..
                 } = cmd
                 {
-                    for section in text_sections {
-                        if section.segname != "__DATA" && section.segname != "__DATA_CONST" {
-                            continue;
-                        }
-
+                    for section in text_sections
+                        .iter()
+                        .filter(|x| x.segname == "__DATA" || x.segname == "__DATA_CONST")
+                    {
                         match section.flags.sect_type() {
                             S_LAZY_SYMBOL_POINTERS | S_NON_LAZY_SYMBOL_POINTERS => {
-                                dbg!(section.addr as u64 + slide);
                                 let indirect_symbol_bindings = platform::read_task_memory(
                                     task,
                                     section.addr as u64 + slide,
